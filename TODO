@@ -1,0 +1,38 @@
+Code cleanup
+	- Since free lists are contained by the task. Do not nuke the task free
+	  lists on new task creations or destroys.
+
+	- Why is there a mm_cow_pf_handler() and a manual implementation in
+	  page_fault()?
+
+	- mm_for_each_dirty_page() could use a more in depth audit
+
+	- Move rng_seed to task structure?
+
+=====================================================
+Code Audit
+
+- Ensure prototypes are correct and sane
+- Ensure code does not exceed 80 character lines
+- Write documentation for any undocumented functions
+- Read through code and make sure usage is sane and safe
+- Add to the TODO list for any things that cannot be immediately fixed, or
+  future ideas
+- Check for security bugs
+- Check for race conditions on globals and current_cpu
+- Make sure SAL annotations are correct and as verbose as possible
+=====================================================
+
+Current code audit status
+Started 2016/10/24
+
+[complete] mm/mm.c
+[complete] time/time.c
+[complete] cpu/cpu.c
+[complete] cpu/acpi.c
+[complete] ide/ide.c
+[complete] disp/disp.c
+[complete] dstruc/hash_table.c
+[complete] generic/locks.c
+[complete] generic/stdlib.c
+

@@ -1,0 +1,355 @@
+#include <fleeb.h>
+#include <generic/stdlib.h>
+#include <fuzzers/chrome/ipcgen.h>
+#include <net/net.h>
+#include <mm/mm.h>
+#include <fuzzers/chrome.h>
+#include <dstruc/hash_table.h>
+#include <vm/vm.h>
+#include <vm/svm.h>
+#include <fuzzers/helpers.h>
+#include <time/time.h>
+#include <disp/disp.h>
+#include <fuzzers/pdf.h>
+
+static uint8_t *pnd_corpus = NULL;
+static uint64_t pnd_corpus_len = 0;
+
+static void
+ftar_l2_random(uint8_t *ftar, uint8_t **pipc, uint64_t *pipc_len)
+{
+	struct _ftar {
+		uint64_t num_entries;
+
+		struct {
+			uint64_t off;
+			uint64_t len;
+		} entry[];
+	} *level1, *level2;
+
+	uint8_t  *ipc;
+	uint64_t  sel, ipc_len;
+
+	level1 = (struct _ftar*)ftar;
+
+	sel    = aes_rand() % level1->num_entries;
+	level2 = (struct _ftar*)((uint8_t*)level1 + level1->entry[sel].off);
+
+	sel     = aes_rand() % level2->num_entries;
+	ipc     = (uint8_t*)level2 + level2->entry[sel].off;
+	ipc_len = level2->entry[sel].len;
+
+	if(ipc_len < 0x14){
+		panic("Corrupt database, length");
+	}
+
+	if(!contains((uint64_t)ipc, (uint64_t)ipc+ipc_len-1,
+				(uint64_t)ftar, (uint64_t)ftar+pnd_corpus_len-1)){
+		panic("Corrupt database, bounds");
+	}
+
+	if(ipc_len != (*(uint32_t*)ipc + 0x14)){
+		*pipc_len = -1;
+		return;
+	}
+
+	*pipc     = ipc;
+	*pipc_len = ipc_len;
+
+	return;
+}
+
+static void
+rand_ftar(
+		_In_reads_bytes_(ftar_len) void     *ftar,
+		_In_                       uint64_t   ftar_len,
+		_Outptr_                   uint8_t  **entry,
+		_Out_                      uint64_t  *entry_len)
+{
+	struct _ftar {
+		uint64_t num_entries;
+
+		struct {
+			uint64_t off;
+			uint64_t len;
+		} entry[];
+	} *level1 = ftar;
+
+	uint8_t *uftar = ftar;
+
+	uint64_t rand_ent, rand_off, rand_len;
+
+	if(ftar_len < sizeof(uint64_t)){
+		panic("ftar too small, header");
+	}
+
+	if(!level1->num_entries || level1->num_entries > 1000000){
+		panic("ftar invalid");
+	}
+
+	if(((level1->num_entries * 16) + 8) > ftar_len){
+		panic("ftar too small, entries");
+	}
+
+	rand_ent = aes_rand() % level1->num_entries;
+	rand_off = level1->entry[rand_ent].off;
+	rand_len = level1->entry[rand_ent].len;
+
+	if(!contains((uint64_t)uftar+rand_off, (uint64_t)uftar+rand_off+rand_len-1,
+				(uint64_t)uftar, (uint64_t)uftar+ftar_len-1)){
+		panic("ftar entry is OOB");
+	}
+
+	*entry     = uftar+rand_off;
+	*entry_len = rand_len;
+	return;
+}
+
+volatile uint64_t num_guest_instrs = 0;
+volatile uint64_t fuzzes = 0;
+volatile uint64_t fuzz_start = 0;
+
+uint8_t *volatile exe_ftar = NULL;
+uint64_t exe_ftar_len;
+
+uint8_t *volatile old_input_ftar = NULL;
+uint64_t old_input_ftar_len;
+
+_Success_(return == RSTATE_SUCCESS)
+_Ret_maybenull_
+rstate_t
+fuzz_defender(void)
+{
+	RSTATE_LOCALS;
+	CPU_LOCALS;
+
+	struct _svm_vm *vm;
+
+	uint64_t stop = 0, last_fuzzes = 0;
+	uint64_t report_freq = 1000000, last_report = 0;
+	static volatile uint64_t active_cores = 0, vmexits = 0;
+
+	struct _hash_table *cc_db;
+	struct _hash_table *input_db;
+	struct _hash_table *crash_db;
+
+	rstate = fuzz_get_cc_db(&cc_db);
+	RSCHECK_NESTED("Could not get cc_db");
+
+	rstate = fuzz_get_input_db(&input_db);
+	RSCHECK_NESTED("Could not get input_db");
+
+	rstate = fuzz_get_crash_db(&crash_db);
+	RSCHECK_NESTED("Could not get crash_db");
+	
+	if(!_InterlockedCompareExchangePointer(&exe_ftar, (void*)1, NULL)){
+		rstate = net_map_remote(cpu->net_queue,
+				"hugepdf.ftar", 1024 * 1024,
+				(void*)&exe_ftar, &exe_ftar_len);
+		RSCHECK_NESTED("Failed to download hugepdf");
+	} else {
+		while((uint64_t)exe_ftar <= 1);
+	}
+
+	if(!_InterlockedCompareExchangePointer(&old_input_ftar, (void*)1, NULL)){
+		rstate = net_map_remote(cpu->net_queue, "waffle.ftar",
+				1024 * 1024,
+				(void*)&old_input_ftar, &old_input_ftar_len);
+		RSCHECK_NESTED("Failed to download ftar");
+	} else {
+		while((uint64_t)old_input_ftar <= 1);
+	}
+
+	if(is_bsp()){
+		stop = rdtsc_future(report_freq);
+		last_report = fuzz_start = rdtsc_uptime();
+	}
+
+	rstate = svm_init();
+	RSCHECK_NESTED("Failed to initialize SVM");
+
+	rstate = svm_create_legacy(&vm, 4ULL * 1024 * 1024 * 1024);
+	RSCHECK_NESTED("Failed to create a VM");
+
+	vm->fuzz_input_max = 16 * 1024 * 1024;
+	rstate = phalloc(vm->fuzz_input_max, &vm->fuzz_input);
+	RSCHECK_NESTED("Failed to allocate room for fuzz input");
+
+	for( ; ; ){
+		rstate = vm_load_snapshot(vm, "defender_0.img");
+		RSCHECK_NESTED("Failed to load VM snapshot");
+
+#if 1
+		{
+			struct _input_ent *input;
+
+			uint8_t *rand_exe;
+			uint64_t rand_exe_len;
+
+try_again:
+			input = ht_rand(input_db);
+			if((aes_rand() % 8) && input){
+				memcpy(vm->fuzz_input, input->buf, input->len);
+				vm->fuzz_input_len = input->len;
+			} else {
+				if(aes_rand() % 8){
+					rand_ftar(exe_ftar, exe_ftar_len, &rand_exe, &rand_exe_len);
+					if(!rand_exe_len || rand_exe_len > vm->fuzz_input_max){
+						goto try_again;
+					}
+					memcpy(vm->fuzz_input, rand_exe, rand_exe_len);
+					vm->fuzz_input_len = rand_exe_len;
+				} else {
+					rand_ftar(old_input_ftar, old_input_ftar_len, &rand_exe, &rand_exe_len);
+					if(!rand_exe_len || rand_exe_len > vm->fuzz_input_max){
+						goto try_again;
+					}
+					memcpy(vm->fuzz_input, rand_exe, rand_exe_len);
+					vm->fuzz_input_len = rand_exe_len;
+				}
+			}
+		}
+
+		{
+#if 1
+			uint64_t corrupts;
+
+			for(corrupts = 0; corrupts < aes_rand() % 4; corrupts++){
+				uint64_t offset, size, pdf_offset;
+
+				if(!vm->fuzz_input_len){
+					goto try_again;
+				}
+
+				offset     = aes_rand() % vm->fuzz_input_len;
+				pdf_offset = aes_rand() % exe_ftar_len;
+				size       = aes_rand() % (32 * 1024);
+
+				if((pdf_offset + size) > exe_ftar_len ||
+						(vm->fuzz_input_len + size) > vm->fuzz_input_max){
+					continue;
+				}
+
+				/* Move back size bytes */
+				memcpy(vm->fuzz_input + offset + size, vm->fuzz_input + offset,
+						vm->fuzz_input_len - offset);
+
+				/* Inject at location */
+				memcpy(vm->fuzz_input + offset, exe_ftar + pdf_offset, size);
+
+				vm->fuzz_input_len += size;
+			}
+
+			for(corrupts = 0; corrupts < aes_rand() % 4; corrupts++){
+				uint64_t offset, size;
+
+				if(!vm->fuzz_input_len){
+					goto try_again;
+				}
+
+				offset = aes_rand() % vm->fuzz_input_len;
+				size   = aes_rand() % vm->fuzz_input_len;
+
+				if((offset + size) > vm->fuzz_input_len){
+					continue;
+				}
+
+				memcpy(vm->fuzz_input + offset, vm->fuzz_input + offset + size,
+						vm->fuzz_input_len - (offset + size));
+				vm->fuzz_input_len -= size;
+			}
+
+			for(corrupts = 0; corrupts < aes_rand() % 4; corrupts++){
+				if(!vm->fuzz_input_len){
+					goto try_again;
+				}
+
+				vm->fuzz_input[aes_rand() % vm->fuzz_input_len] = aes_rand() & 0xff;
+			}
+
+			bzero(vm->fuzz_input + vm->fuzz_input_len,
+					vm->fuzz_input_max - vm->fuzz_input_len);
+#endif
+		}
+#endif
+
+		vm_write_virt(vm, vm->gprs->rip, "\xcc", 1);
+
+		rstate = win32_gen_modlist(vm);
+		RSCHECK_NESTED("Failed to generate windows modlist");
+
+		rstate = vm_step(vm);
+		RSCHECK_NESTED("VM single step failure");
+
+		if(vm->vmcb->exitcode >= 0x40 && vm->vmcb->exitcode < 0x60){
+			void **hte;
+
+			__m128i hash = win32_classify_crash(vm);
+			//hash = _mm_aesenc_si128(hash, _mm_cvtsi64_si128(vm->gprs->rcx));
+
+			if(ht_fetch_or_lock(crash_db, hash, (void**)&hte)){
+				char crashfn[256];
+				__m128i input;
+
+				struct _modlist *mod = win32_resolve_module(vm, vm->gprs->rip);
+
+				if(mod){
+					printf("New crash @ %.*s", (unsigned int)mod->namelen, mod->name);
+				}
+
+				fuzz_report_crash(vm);
+
+				snprintf(crashfn, 128,
+						"file_storage\\fuzz_out\\%.4I64x_%.16I64x_%.16I64x.inp",
+						vm->vmcb->exitcode, vm->gprs->rip, vm->vmcb->exitinfo2);
+				//x540_save_file(crashfn, vm->fuzz_input, vm->fuzz_input_len);
+
+				fuzz_input_create(vm->fuzz_input, vm->fuzz_input_len, &input, NULL);
+
+				printf("New crash %.4I64x %.16I64x %.16I64x %I64u",
+						vm->vmcb->exitcode,
+						vm->gprs->rip, vm->vmcb->exitinfo2,
+						vm->instrs);
+
+				*hte = (void*)100;
+			}
+		}
+
+		active_cores |= (1ULL << cpu->cpu_id);
+
+		_InterlockedExchangeAdd64(&fuzzes, 1);
+		_InterlockedExchangeAdd64(&vmexits, vm->vmexits);
+
+		if(is_bsp() && __rdtsc() > stop){
+			uint64_t fuzz_delta = fuzzes - last_fuzzes;
+
+			printf(
+					"%10s %6s %8s %11s %7s %7s %7s %7s %7s %16s",
+					"fuzzes", "fcps", "memuse", "instrs",
+					"ccdb", "inputs", "crashes", "vmepfc", "uspfc", "cores");
+
+			printf(
+					"%10I64u %6I64u %8I64u %11I64u %7I64u %7I64u %7I64u %7I64u %7I64u %.16I64x",
+					fuzzes, fuzz_delta * 1000000 / (rdtsc_uptime() - last_report),
+					0ULL,
+					num_guest_instrs / fuzzes,
+					cc_db->entries, input_db->entries, crash_db->entries,
+					vmexits / fuzzes,
+					(rdtsc_uptime() - fuzz_start) / fuzzes,
+					active_cores);
+
+			//profiling_dump();
+			stop = rdtsc_future(report_freq);
+			last_fuzzes = fuzzes;
+			active_cores = 0;
+			last_report = rdtsc_uptime();
+		}
+
+		//halt();
+	}
+
+	rstate_ret = RSTATE_SUCCESS;
+cleanup:
+	RSTATE_RETURN;
+}
+

@@ -1,0 +1,300 @@
+#include <falkos.h>
+#include <generic/stdlib.h>
+#include <fuzzers/chrome/ipcgen.h>
+#include <net/x540.h>
+#include <mm/mm.h>
+#include <fuzzers/chrome.h>
+#include <dstruc/hash_table.h>
+#include <vm/vm.h>
+#include <vm/svm.h>
+#include <fuzzers/helpers.h>
+#include <time/time.h>
+#include <profiling/profiling.h>
+#include <disp/disp.h>
+
+static uint8_t *pnd_corpus = NULL;
+static uint64_t pnd_corpus_len = 0;
+
+static void
+ftar_l2_random(uint8_t *ftar, uint8_t **pipc, uint64_t *pipc_len)
+{
+	struct _ftar {
+		uint64_t num_entries;
+
+		struct {
+			uint64_t off;
+			uint64_t len;
+		} entry[];
+	} *level1, *level2;
+
+	uint8_t  *ipc;
+	uint64_t  sel, ipc_len;
+
+	level1 = (struct _ftar*)ftar;
+
+	sel    = rand() % level1->num_entries;
+	level2 = (struct _ftar*)((uint8_t*)level1 + level1->entry[sel].off);
+
+	sel     = rand() % level2->num_entries;
+	ipc     = (uint8_t*)level2 + level2->entry[sel].off;
+	ipc_len = level2->entry[sel].len;
+
+	if(ipc_len < 0x14){
+		panic("Corrupt database, length");
+	}
+
+	if(!contains((uint64_t)ipc, (uint64_t)ipc+ipc_len-1,
+				(uint64_t)ftar, (uint64_t)ftar+pnd_corpus_len-1)){
+		panic("Corrupt database, bounds");
+	}
+
+	if(ipc_len != (*(uint32_t*)ipc + 0x14)){
+		*pipc_len = -1;
+		return;
+	}
+
+	*pipc     = ipc;
+	*pipc_len = ipc_len;
+
+	return;
+}
+
+_Success_(return == RSTATE_SUCCESS)
+_Ret_maybenull_
+rstate_t
+fill_ipc_stream(uint8_t *fuzz_input, uint64_t *fuzz_input_len)
+{
+	THREAD_LOCALS;
+	RSTATE_LOCALS;
+
+	struct _ipc_stream *ipc_stream;
+
+	uint64_t i;
+
+	if(!pnd_corpus){
+		x540_map_remote("file_storage\\chrome_corpus.ftar", &pnd_corpus,
+				&pnd_corpus_len);
+	}
+
+	if(!current->ipc_stream){
+		rstate = alloc(sizeof(struct _ipc_stream), &current->ipc_stream);
+		RSCHECK_NESTED("Failed to allocate room for IPC stream");
+	}
+	ipc_stream = current->ipc_stream;
+
+	if(!(rand() % 1)){
+		struct _input_ent *input;
+		struct _hash_table *input_db;
+
+		fuzz_get_input_db(&input_db);
+
+		if(input_db){
+			input = ht_rand(input_db);
+			if(input){
+				memcpy(ipc_stream, input->buf, input->len);
+			}
+		}
+	} else {
+		bzero(ipc_stream, sizeof(struct _ipc_stream));
+	}
+
+	for(i = 0; i < NUM_IPC_MESSAGES; i++){
+		uint8_t *ipc_a, holding[64 * 1024];
+		uint64_t ipc_a_len, ipc_test_len;
+
+		/* Random chance to replace an IPC message */
+		if(!(rand() % 16)){
+			if(rand() % 2){
+				ipc_a_len = gen_ipc_stream(holding, sizeof(holding), 1);
+				if(ipc_a_len <= MAX_IPC_SIZE){
+					memcpy(ipc_stream->ipc[i].msg, holding, ipc_a_len);
+					ipc_stream->ipc[i].filled = 1;
+				}
+			} else {
+				ftar_l2_random(pnd_corpus, &ipc_a, &ipc_a_len);
+				if(ipc_a_len <= MAX_IPC_SIZE){
+					memcpy(ipc_stream->ipc[i].msg, ipc_a, ipc_a_len);
+					ipc_stream->ipc[i].filled = 1;
+				}
+			}
+
+			if(ipc_stream->ipc[i].filled){
+				ipc_test_len = *(uint32_t*)ipc_stream->ipc[i].msg + 0x14;
+				if(ipc_test_len != ipc_a_len){
+					ipc_stream->ipc[i].filled = 0;
+				}
+			}
+		}
+
+		/* Random generation */
+		if(!(rand() % 16)){
+			if(gen_ipc_rand(ipc_stream->ipc[i].msg, MAX_IPC_SIZE, 1)){
+				ipc_stream->ipc[i].filled = 1;
+			}
+		}
+
+		/* Random chance to delete an IPC message */
+		if(!(rand() % 16))
+			ipc_stream->ipc[i].filled = 0;
+
+		/* Random chance to corrupt an IPC message */
+		if(!(rand() % 16)){
+			uint32_t jj;
+
+			struct {
+				uint32_t len;
+				uint32_t route;
+				uint32_t msg_id;
+				uint32_t flags;
+				uint32_t unk;
+				uint8_t  data[];
+			} *ipc;
+
+			ipc = (void*)ipc_stream->ipc[i].msg;
+
+			if(!(rand() % 64)){
+				ipc->route = rand() % 16;
+			}
+
+			if(!(rand() % 64)){
+				ipc->msg_id = ((rand() % 113) << 16) | (rand() % 24856);
+			}
+
+			for(jj = 0; jj < ipc->len; jj++){
+				if(!(rand() % 256)){
+					ipc->data[jj] = (uint8_t)rand();
+				}
+			}
+		}
+	}
+
+	{
+		uint8_t *ptr = fuzz_input;
+
+		*fuzz_input_len = 0;
+		for(i = 0; i < NUM_IPC_MESSAGES; i++){
+			uint32_t ipc_len;
+
+			if(!ipc_stream->ipc[i].filled)
+				continue;
+
+			ipc_len = *(uint32_t*)ipc_stream->ipc[i].msg + 0x14;
+
+			memcpy(ptr, ipc_stream->ipc[i].msg, ipc_len);
+			ptr             += ipc_len;
+			*fuzz_input_len += ipc_len;
+		}
+	}
+
+	rstate_ret = RSTATE_SUCCESS;
+cleanup:
+	RSTATE_RETURN;
+}
+
+volatile uint64_t num_guest_instrs = 0;
+volatile uint64_t fuzzes = 0;
+volatile uint64_t fuzz_start = 0;
+
+_Success_(return == RSTATE_SUCCESS)
+_Ret_maybenull_
+rstate_t
+fuzz_chrome(void)
+{
+	RSTATE_LOCALS;
+	THREAD_LOCALS;
+
+	struct _vm *vm;
+
+	uint64_t stop = 0, last_fuzzes = 0;
+	uint64_t report_freq = 1000000;
+	static volatile uint64_t active_cores = 0;
+	uint8_t fuzz_buf[512 * 1024];
+
+	struct _hash_table *cc_db;
+	struct _hash_table *input_db;
+	struct _hash_table *crash_db;
+
+	rstate = fuzz_get_cc_db(&cc_db);
+	RSCHECK_NESTED("Could not get cc_db");
+
+	rstate = fuzz_get_input_db(&input_db);
+	RSCHECK_NESTED("Could not get input_db");
+
+	rstate = fuzz_get_crash_db(&crash_db);
+	RSCHECK_NESTED("Could not get crash_db");
+
+	if(is_bsp()){
+		stop = rdtsc_future(report_freq);
+		fuzz_start = rdtsc_uptime();
+	}
+
+	rstate = svm_init();
+	RSCHECK_NESTED("Failed to initialize SVM");
+
+	rstate = vm_create(&vm, 4ULL * 1024 * 1024 * 1024);
+	RSCHECK_NESTED("Failed to create a VM");
+
+	for( ; ; ){
+		rstate = vm_load_snapshot(vm, "file_storage\\chrome_00.img");
+		RSCHECK_NESTED("Failed to load VM snapshot");
+
+#if 1
+		{
+			uint64_t ipc_buf = 0x133700000000, ipc_buf_len = 0;
+
+			fill_ipc_stream(fuzz_buf, &ipc_buf_len);
+
+			rstate = vm_mm_write_guest_virt(vm, ipc_buf, fuzz_buf, ipc_buf_len);
+			RSCHECK_NESTED("Failed to get backing for IPC buffer");
+
+			vm->gprs->rdx = ipc_buf;
+			vm->gprs->r8  = ipc_buf_len;
+
+			vm->fuzz_input     = fuzz_buf;
+			vm->fuzz_input_len = ipc_buf_len;
+		}
+#endif
+
+		rstate = vm_step(vm);
+		RSCHECK_NESTED("VM single step failure");
+
+		if(vm->vmcb->exitcode >= 0x40 && vm->vmcb->exitcode < 0x60){
+			void **hte;
+
+			__m128i hash = _mm_aesenc_si128(_mm_cvtsi64_si128(vm->gprs->rip),
+					_mm_cvtsi64_si128(vm->vmcb->exitcode));
+
+			if(ht_fetch_or_lock(crash_db, hash, (void**)&hte)){
+				printf("New crash %.4I64x %.16I64x %.16I64x",
+						vm->vmcb->exitcode,
+						vm->gprs->rip, vm->vmcb->exitinfo2);
+				*hte = (void*)100;
+			}
+		}
+
+		active_cores |= (1ULL << current->core_id);
+
+		fuzzes++;
+		if(is_bsp() && __rdtsc() > stop){
+			uint64_t fuzz_delta = fuzzes - last_fuzzes;
+
+			printf(
+					"%8I64u %6I64u %8I64u %8I64u %7I64u %7I64u %5I64u %.16I64x",
+					fuzzes, fuzzes * 1000000 / (rdtsc_uptime() - fuzz_start),
+					mm_get_memuse() / 1024 / 1024,
+					num_guest_instrs / fuzzes,
+					cc_db->entries, input_db->entries, crash_db->entries,
+					active_cores);
+
+			profiling_dump();
+			stop = rdtsc_future(report_freq);
+			last_fuzzes = fuzzes;
+			active_cores = 0;
+		}
+	}
+
+	rstate_ret = RSTATE_SUCCESS;
+cleanup:
+	RSTATE_RETURN;
+}
+
