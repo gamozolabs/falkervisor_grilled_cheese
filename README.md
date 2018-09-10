@@ -1,5 +1,10 @@
 # Falkervisor (grilled_cheese)
 
+## Twitter
+
+Follow me on Twitter, @gamozolabs
+Tweets go out before my reddit post spam, also I announce live streams there
+
 ## See it in action
 
 This was me using it to fuzz r2 back when this was under active development. This video should provide enough background to modify it for your own use.
