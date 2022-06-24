@@ -1814,7 +1814,6 @@ mm_cow_pf_handler(
 		_In_ int             write_req,
 		_In_ int             exec_req)
 {
-	uint32_t  tmp;
 	uint64_t  entry, offset;
 	uintptr_t phys;
 	struct _cow_map_state *cms = param;
@@ -1827,7 +1826,7 @@ mm_cow_pf_handler(
 	/* Force an access of the backing memory. This will cause it to be pulled
 	 * into memory if it's a lazy allocation or a remote page.
 	 */
-	tmp = *(volatile uint32_t*)cms->backing;
+	*(volatile uint32_t*)cms->backing;
 
 	mm_acquire_paging_lock();
 
@@ -1922,7 +1921,7 @@ mm_create_cow(
 		_In_opt_                   uint64_t     key,
 		_Outptr_                   void       **out_buf)
 {
-	uint8_t  *ubuf, *new_mem;
+	uint8_t  *new_mem;
 	uint64_t  new_mem_key, offset = 0;
 
 	RSTATE_LOCALS;
@@ -1932,9 +1931,6 @@ mm_create_cow(
 	/* Page align the length */
 	orig_len +=  0xfff;
 	orig_len &= ~0xfff;
-
-	/* Page align the buffer */
-	ubuf = (void*)((uintptr_t)orig_buf & ~0xfff);
 
 	if(!addr){
 		/* Create a new reservation */

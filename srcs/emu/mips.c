@@ -177,8 +177,6 @@ emu_mips_create(void)
 	RSCHECK_NESTED("Failed to create COW of regs image");
 
 	for( ; ; ){
-		int had_yield = 0;
-
 		struct _iret iret;
 
 		uint64_t start_ticks, timeout;
@@ -281,8 +279,6 @@ emu_mips_create(void)
 						}
 						
 						*ent = (void*)entry;
-
-						had_yield = 1;
 					}
 					
 					*(uint8_t*)(current_cpu->um_exception.iret.rip - 1) = 0x90;

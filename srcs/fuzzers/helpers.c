@@ -209,7 +209,7 @@ fuzz_cc_report(
 	from_mod = win32_resolve_module(vm, from);
 	to_mod   = win32_resolve_module(vm, to);
 
-#if 0
+#if 1
 	/* Only do coverage on addresses we can resolve modules for */
 	if(!from_mod || !to_mod){
 		if(new_ent) *new_ent = 0;
